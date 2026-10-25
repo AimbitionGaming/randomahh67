@@ -1,101 +1,169 @@
 
--- Phantom Forces - Matcha
--- Clean Auto Fire + Anti-Recoil
--- UI: INS-UI (from your original script)
--- P: Open/close UI
--- F6: Enable/disable macro
+-- PF Matcha - Fire Control + GC Scaling
+-- P = UI | F6 = Toggle
+-- No mouse movement for recoil
 
--- Clean previous instances
-if _G.PFOnlyStop then
-    pcall(_G.PFOnlyStop)
+if _G.PF_Stop then
+    pcall(_G.PF_Stop)
 end
 
-if _G.MatchaTracerCleanup then
-    pcall(_G.MatchaTracerCleanup)
-end
-
-if _G.MatchaTracerWindow then
-    pcall(function()
-        _G.MatchaTracerWindow:Destroy()
-    end)
-    _G.MatchaTracerWindow = nil
-end
-
-task.wait(0.2)
-
--- Load original UI library using Matcha-compatible HTTP
-local url =
-    "https://raw.githubusercontent.com/" ..
-    "neaxusxgod-png/INS-ui/main/uilib.min.lua"
-
-local loaded, loadErr = pcall(function()
-    local source = httpget(url)
-    local execute = loadstring(source)
-    execute()
-end)
-
-local Lib = _G.INSui or _G.INSUI
-
-if not Lib then
-    warn("[PF] INS-UI failed to load:", loadErr)
-    return
-end
-
--- CONFIGURATION
 local cfg = {
     enabled = false,
     autoFire = true,
     antiRecoil = true,
-
-    trigger = "Hold RMB",
+    reduction = 85,
+    trigger = "LMB",
     mode = "Semi / Binary",
-
     rpm = 950,
-    pressMs = 12,
-    releaseMs = 30,
-    burstTrim = 0,
-
-    recoilStrength = 85,
-    recoilX = 0,
-    recoilY = 3
+    pressMs = 15,
+    trimMs = 0,
+    releaseMs = 40
 }
 
 local state = {
     running = true,
-    syntheticHeld = false,
-    remainderX = 0,
-    remainderY = 0
+    held = false,
+    physicalLMB = false,
+    useEvents = false,
+    suppressUntil = 0,
+    connections = {},
+    entries = {},
+    window = nil
 }
 
-local win = nil
+local recoilKeys = {
+    "_firemodeStability",
+    "hipfirespread",
+    "aimfirespread"
+}
 
--- INPUT CONTROL
 local function release()
-    if state.syntheticHeld then
-        state.syntheticHeld = false
+    if state.held then
+        state.suppressUntil = tick() + 0.025
         mouse1release()
+        state.held = false
     end
 end
 
-local function press()
-    if not state.syntheticHeld then
-        mouse1press()
-        state.syntheticHeld = true
+local function restoreRecoil()
+    for _, item in ipairs(state.entries) do
+        pcall(function()
+            applygc(
+                {item.entry},
+                item.key,
+                item.original
+            )
+        end)
     end
 end
+
+local function applyRecoil()
+    if not cfg.antiRecoil then
+        restoreRecoil()
+        return
+    end
+
+    local factor =
+        1 - math.max(0, math.min(
+            100, cfg.reduction
+        )) / 100
+
+    local changed = 0
+
+    for _, item in ipairs(state.entries) do
+        local ok, count = pcall(function()
+            return applygc(
+                {item.entry},
+                item.key,
+                item.original * factor
+            )
+        end)
+
+        if ok and type(count) == "number" then
+            changed = changed + count
+        end
+    end
+
+    return changed
+end
+
+local function scanRecoil()
+    restoreRecoil()
+    state.entries = {}
+
+    local ok, results = pcall(function()
+        return getgc(recoilKeys)
+    end)
+
+    if not ok or type(results) ~= "table" then
+        warn("[PF] GC scan failed")
+        return
+    end
+
+    for _, entry in ipairs(results) do
+        if type(entry) == "table"
+            and type(entry.value) == "number"
+            and type(entry.key) == "string" then
+
+            table.insert(state.entries, {
+                entry = entry,
+                key = entry.key,
+                original = entry.value
+            })
+        end
+    end
+
+    local changed = applyRecoil()
+
+    print(
+        "[PF] GC entries:",
+        #state.entries,
+        "Modified:",
+        changed or 0
+    )
+end
+
+-- Physical LMB event tracking
+local input = game:GetService("UserInputService")
+
+local okEvents = pcall(function()
+    local began = input.InputBegan:Connect(function(obj)
+        if obj.UserInputType ==
+            Enum.UserInputType.MouseButton1 then
+
+            if tick() >= state.suppressUntil then
+                state.physicalLMB = true
+            end
+        end
+    end)
+
+    local ended = input.InputEnded:Connect(function(obj)
+        if obj.UserInputType ==
+            Enum.UserInputType.MouseButton1 then
+
+            if tick() >= state.suppressUntil then
+                state.physicalLMB = false
+            end
+        end
+    end)
+
+    table.insert(state.connections, began)
+    table.insert(state.connections, ended)
+end)
+
+state.useEvents = okEvents
 
 local function triggerHeld()
-    if cfg.trigger == "Hold RMB" then
+    if cfg.trigger == "RMB" then
         return ismouse2pressed()
-
-    elseif cfg.trigger == "Hold F" then
+    elseif cfg.trigger == "F" then
         return iskeypressed(0x46)
-
-    elseif cfg.trigger == "Hold LMB" then
+    else
+        if state.useEvents then
+            return state.physicalLMB
+        end
         return ismouse1pressed()
     end
-
-    return false
 end
 
 local function active()
@@ -105,215 +173,172 @@ local function active()
         and triggerHeld()
 end
 
-local function intervalMs()
+local function interval()
     return 60000 / math.max(1, cfg.rpm)
 end
 
--- Interruptible timer
 local function waitUntil(deadline)
     while state.running and tick() < deadline do
-        if not active() then
-            return false
-        end
+        if not active() then return false end
         task.wait(0.005)
     end
-
     return active()
 end
 
 local function waitMs(ms)
-    return waitUntil(
-        tick() + math.max(0, ms) / 1000
-    )
+    return waitUntil(tick() + ms / 1000)
 end
 
--- RECOIL COMPENSATION
-local function integerPart(n)
-    if n >= 0 then
-        return math.floor(n)
-    end
-
-    return math.ceil(n)
-end
-
-local function compensate()
-    if not cfg.antiRecoil then return end
-    if not active() then return end
-
-    local strength = cfg.recoilStrength / 100
-
-    state.remainderX = state.remainderX
-        + cfg.recoilX * strength
-
-    state.remainderY = state.remainderY
-        + cfg.recoilY * strength
-
-    local dx = integerPart(state.remainderX)
-    local dy = integerPart(state.remainderY)
-
-    state.remainderX = state.remainderX - dx
-    state.remainderY = state.remainderY - dy
-
-    if dx ~= 0 or dy ~= 0 then
-        mousemoverel(dx, dy)
+local function press()
+    if not state.held then
+        state.suppressUntil = tick() + 0.025
+        mouse1press()
+        state.held = true
     end
 end
 
--- SEMI-AUTO / BINARY
 local function fireSemi()
-    local interval = intervalMs()
-    local start = tick()
+    local spacing = interval()
+    local started = tick()
+
+    press()
 
     local hold = math.min(
         cfg.pressMs,
-        math.max(5, interval - 5)
+        math.max(5, spacing - 5)
     )
-
-    press()
-    compensate()
 
     waitMs(hold)
     release()
 
     if active() then
-        local elapsed = (tick() - start) * 1000
+        local elapsed =
+            (tick() - started) * 1000
 
-        local remaining = math.max(
+        waitMs(math.max(
             cfg.releaseMs,
-            interval + 10 - elapsed
-        )
-
-        waitMs(remaining)
+            spacing + 10 - elapsed
+        ))
     end
 end
 
--- HOLD-TO-BURST
 local function fireBurst(rounds)
-    local interval = intervalMs()
+    local spacing = interval()
 
-    -- Your requested formula
-    local cycleMs =
-        interval * rounds + 10
+    local cycle = spacing * rounds + 10
 
-    local holdMs =
-        interval * (rounds - 1)
-        + 10 + cfg.burstTrim
+    local hold =
+        (rounds - 1) * spacing
+        + 10 + cfg.trimMs
 
-    holdMs = math.max(
+    hold = math.max(
         5,
-        math.min(holdMs, interval * rounds - 5)
+        math.min(hold, rounds * spacing - 5)
     )
 
-    local start = tick()
-    local completed = true
+    local started = tick()
 
     press()
-
-    -- Apply recoil compensation for
-    -- each theoretical bullet in the burst
-    for i = 1, rounds do
-        local target =
-            start + ((i - 1) * interval) / 1000
-
-        if not waitUntil(target) then
-            completed = false
-            break
-        end
-
-        compensate()
-    end
-
-    if completed then
-        waitUntil(start + holdMs / 1000)
-    end
-
+    waitUntil(started + hold / 1000)
     release()
 
     if active() then
-        local elapsed = (tick() - start) * 1000
+        local elapsed =
+            (tick() - started) * 1000
 
-        local remaining = math.max(
+        waitMs(math.max(
             cfg.releaseMs,
-            cycleMs - elapsed
-        )
-
-        waitMs(remaining)
+            cycle - elapsed
+        ))
     end
 end
 
--- FULL AUTO
 local function fireAuto()
-    -- With physical LMB, allow normal
-    -- continuous firing without synthetic presses.
-    if cfg.trigger ~= "Hold LMB" then
+    -- Physical LMB already maintains the hold.
+    if cfg.trigger ~= "LMB" then
         press()
     end
 
     while active()
         and cfg.autoFire
         and cfg.mode == "Full Auto" do
-
-        compensate()
-
-        if not waitMs(intervalMs()) then
-            break
-        end
+        task.wait(0.01)
     end
 
     release()
 end
 
--- UNLOAD FUNCTION
-_G.PFOnlyStop = function()
-    state.running = false
+_G.PF_Stop = function()
     cfg.enabled = false
+    state.running = false
     release()
+    restoreRecoil()
 
-    if win then
+    for _, conn in ipairs(state.connections) do
         pcall(function()
-            win:Destroy()
+            conn:Disconnect()
         end)
-        win = nil
+    end
+
+    if state.window then
+        pcall(function()
+            state.window:Destroy()
+        end)
     end
 end
 
--- UI
-win = Lib:CreateWindow({
+-- LOAD INS-UI
+local url =
+    "https://raw.githubusercontent.com/" ..
+    "neaxusxgod-png/INS-ui/main/uilib.min.lua"
+
+local loaded, loadError = pcall(function()
+    loadstring(httpget(url))()
+end)
+
+local Lib = _G.INSui or _G.INSUI
+
+if not loaded or not Lib then
+    warn("[PF] UI load failed:", loadError)
+    _G.PF_Stop()
+    return
+end
+
+local win = Lib:CreateWindow({
     title = "PF Fire Control",
-    subtitle = "Auto Fire + Anti-Recoil",
-    size = Vector2.new(580, 460),
+    subtitle = "Auto Fire + GC Compensation",
+    size = Vector2.new(580, 450),
     menuKey = "p",
-    configName = "pf_fire_control",
+    configName = "pf_gc_fire",
     configFolder = "PFControl",
     autoSave = true,
     startOpen = true
 })
 
+state.window = win
+
 local tab = win:Tab("Fire Control", "sliders")
+local general = tab:Section("General", "Left")
 
-local main = tab:Section("General", "Left")
-
-main:Toggle("Enable Macro (F6)", false, function(v)
+general:Toggle("Enabled", false, function(v)
     cfg.enabled = v
-
-    if not v then
-        release()
-    end
+    if not v then release() end
 end)
 
-main:Toggle("Auto Fire", true, function(v)
+general:Toggle("Auto Fire", true, function(v)
     cfg.autoFire = v
     if not v then release() end
 end)
 
-main:Toggle("Anti-Recoil", true, function(v)
+general:Toggle("GC Compensation", true, function(v)
     cfg.antiRecoil = v
+    applyRecoil()
 end)
 
-main:Dropdown(
-    "Activation Button",
+general:Dropdown(
+    "Activation",
     {cfg.trigger},
-    {"Hold RMB", "Hold F", "Hold LMB"},
+    {"LMB", "RMB", "F"},
     false,
     function(v)
         if v and v[1] then
@@ -323,13 +348,9 @@ main:Dropdown(
     end
 )
 
-main:Info(
-    "Hold the activation button while Roblox is focused."
-)
+local firing = tab:Section("Firing", "Left")
 
-local fire = tab:Section("Fire Settings", "Left")
-
-fire:Dropdown(
+firing:Dropdown(
     "Fire Mode",
     {cfg.mode},
     {
@@ -348,119 +369,93 @@ fire:Dropdown(
     end
 )
 
-fire:Slider(
-    "Weapon RPM",
+firing:Slider(
+    "RPM",
     cfg.rpm, 10, 100, 2500, "RPM",
     function(v) cfg.rpm = v end
 )
 
-fire:Slider(
-    "Semi Press Duration",
+firing:Slider(
+    "Press Duration",
     cfg.pressMs, 1, 5, 50, "ms",
     function(v) cfg.pressMs = v end
 )
 
-fire:Slider(
+firing:Slider(
     "Burst Hold Trim",
-    cfg.burstTrim, 1, -20, 40, "ms",
-    function(v) cfg.burstTrim = v end
+    cfg.trimMs, 1, -20, 40, "ms",
+    function(v) cfg.trimMs = v end
 )
 
-fire:Slider(
+firing:Slider(
     "Minimum Release",
     cfg.releaseMs, 5, 5, 200, "ms",
     function(v) cfg.releaseMs = v end
 )
 
-local recoil = tab:Section("Anti-Recoil", "Right")
+local recoil = tab:Section("GC Settings", "Right")
 
 recoil:Slider(
-    "Compensation Strength",
-    cfg.recoilStrength,
-    5, 0, 150, "%",
-    function(v) cfg.recoilStrength = v end
-)
-
-recoil:Slider(
-    "Vertical Per Shot",
-    cfg.recoilY,
-    0.1, -15, 15, "px",
-    function(v) cfg.recoilY = v end
-)
-
-recoil:Slider(
-    "Horizontal Per Shot",
-    cfg.recoilX,
-    0.1, -15, 15, "px",
-    function(v) cfg.recoilX = v end
+    "Value Reduction",
+    cfg.reduction, 1, 0, 100, "%",
+    function(v)
+        cfg.reduction = v
+        applyRecoil()
+    end
 )
 
 recoil:Info(
-    "Positive vertical moves down. " ..
-    "Strength scales the configured mouse movement."
+    "Scales original stability/spread values. " ..
+    "Actual camera recoil reduction is unverified."
 )
 
-local tools = tab:Section("Controls", "Right")
+recoil:Button("Rescan Weapon Values", function()
+    scanRecoil()
+end)
 
-tools:Button("Print Settings", function()
+recoil:Button("Restore Original Values", function()
+    restoreRecoil()
+    cfg.antiRecoil = false
+end)
+
+local controls = tab:Section("Controls", "Right")
+
+controls:Button("Diagnostics", function()
     print("[PF] Enabled:", cfg.enabled)
-    print("[PF] Auto Fire:", cfg.autoFire)
-    print("[PF] Recoil:", cfg.antiRecoil)
     print("[PF] Trigger:", cfg.trigger)
+    print("[PF] Trigger held:", triggerHeld())
     print("[PF] Mode:", cfg.mode)
     print("[PF] RPM:", cfg.rpm)
-    print("[PF] Shot interval:", intervalMs())
+    print("[PF] GC entries:", #state.entries)
+    print("[PF] Event hook:", state.useEvents)
 end)
 
-tools:Button("Disable Macro", function()
-    cfg.enabled = false
-    release()
-    print("[PF] Macro disabled")
-end)
-
-tools:Button("Unload", function()
-    _G.PFOnlyStop()
+controls:Button("Unload", function()
+    _G.PF_Stop()
 end)
 
 win:AddSettingsTab("cog")
 
--- FIRING ENGINE
+-- FIRING LOOP
 task.spawn(function()
     while state.running do
-        if not active() then
+        if not active() or not cfg.autoFire then
             release()
-            state.remainderX = 0
-            state.remainderY = 0
-
             task.wait(0.01)
         else
-            if cfg.autoFire then
-                if cfg.mode == "Semi / Binary" then
-                    fireSemi()
-
-                elseif cfg.mode == "2 Round Burst" then
-                    fireBurst(2)
-
-                elseif cfg.mode == "3 Round Burst" then
-                    fireBurst(3)
-
-                elseif cfg.mode == "4 Round Burst" then
-                    fireBurst(4)
-
-                elseif cfg.mode == "Full Auto" then
-                    fireAuto()
-                end
-            else
-                -- Recoil only during manual LMB firing
-                if ismouse1pressed() then
-                    compensate()
-                end
-
-                waitMs(intervalMs())
+            if cfg.mode == "Semi / Binary" then
+                fireSemi()
+            elseif cfg.mode == "2 Round Burst" then
+                fireBurst(2)
+            elseif cfg.mode == "3 Round Burst" then
+                fireBurst(3)
+            elseif cfg.mode == "4 Round Burst" then
+                fireBurst(4)
+            elseif cfg.mode == "Full Auto" then
+                fireAuto()
             end
         end
     end
-
     release()
 end)
 
@@ -469,26 +464,25 @@ task.spawn(function()
     local previous = false
 
     while state.running do
-        local pressed = iskeypressed(0x75)
+        local down = iskeypressed(0x75)
 
-        if pressed and not previous then
+        if down and not previous then
             cfg.enabled = not cfg.enabled
-
-            if not cfg.enabled then
-                release()
-            end
-
-            print(
-                "[PF]",
-                cfg.enabled and "ON" or "OFF"
-            )
+            if not cfg.enabled then release() end
+            print("[PF] Enabled:", cfg.enabled)
         end
 
-        previous = pressed
+        previous = down
         task.wait(0.03)
     end
 end)
 
-print("[PF] Fire Control loaded")
-print("[PF] Press P to open UI")
-print("[PF] F6 toggles macro")
+-- Apply GC values on startup
+task.spawn(function()
+    task.wait(0.5)
+    if state.running then
+        scanRecoil()
+    end
+end)
+
+print("[PF] Loaded. Press P for UI.")
